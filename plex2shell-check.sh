@@ -31,6 +31,7 @@ FIXED_BUILD="1.43.3.10861"
 SINCE="2026-10-15"
 HITS=0
 WARNS=0
+ATTEMPTS=0
 DIRS=()
 RULES=""
 REPORT=""
@@ -57,6 +58,7 @@ declare -A IOC_SHA256=(
 # ------------------------------------------------------------------ output helpers
 if [ -t 1 ]; then R=$'\e[1;31m' Y=$'\e[1;33m' G=$'\e[32m' B=$'\e[1m' N=$'\e[0m'; else R='' Y='' G='' B='' N=''; fi
 hit()     { HITS=$((HITS + 1));   printf '%s[HIT]%s  %s\n' "$R" "$N" "$*"; }
+attempt() { ATTEMPTS=$((ATTEMPTS + 1)); printf '%s[ATTEMPT]%s %s\n' "$Y" "$N" "$*"; }
 warn()    { WARNS=$((WARNS + 1)); printf '%s[WARN]%s %s\n' "$Y" "$N" "$*"; }
 ok()      { printf '%s[OK]%s   %s\n' "$G" "$N" "$*"; }
 info()    { printf '[INFO] %s\n' "$*"; }
@@ -129,7 +131,7 @@ for rel in "${REL_DEFAULTS[@]}"; do add_dir "/$rel" ""; done
 # Running PMS processes: works for native, Docker, LXC, anything with its own mount namespace
 for pid in "${PMS_PIDS[@]}"; do
     root="/proc/$pid/root"
-    asd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR=//p')
+    asd=$({ tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null | sed -n 's/^PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR=//p')
     [ -n "$asd" ] && add_dir "$root$asd/Plex Media Server" "$root"
     for rel in "${REL_DEFAULTS[@]}"; do add_dir "$root/$rel" "$root"; done
 done
@@ -144,7 +146,7 @@ fi
 
 # ================================================================== report
 printf '%splex2shell-check%s  %s  host=%s  root=%s\n' "$B" "$N" "$(date -u +%FT%TZ)" "$(hostname)" "$([ $IS_ROOT -eq 1 ] && echo yes || echo NO)"
-[ $IS_ROOT -eq 1 ] || warn "not running as root: container filesystems, other users' processes and some files will be skipped"
+[ $IS_ROOT -eq 1 ] || warn "NOT RUNNING AS ROOT: Preferences.xml, Plex's processes and container filesystems can't be inspected, so a clean result is incomplete. Re-run with: sudo bash $0"
 
 if [ ${#DIRS_FOUND[@]} -eq 0 ]; then
     warn "no Plex data directory found. If Plex runs in a stopped container/VM or a custom path, pass it with -d"
@@ -194,8 +196,12 @@ fi
 [ $vchecked -eq 1 ] || warn "could not determine the PMS version - check Settings > General in Plex Web and make sure it is >= $FIXED_BUILD"
 
 # ------------------------------------------------------------------ 2. exploit traces in Plex data
+# Stage 1: the unauthenticated SSRF request. A patched server answers it with 400 "unsupported protocol".
+LOG_ATTEMPT='/player/timeline/subscribe\?([^ ]*&)?protocol=[a-z0-9+.-]{1,16}(%3a|%253a|:)'
+# Lines that only echo a stage-1 request (the request itself, its response, the rejection warning)
+LOG_ATTEMPT_ECHO='/player/timeline/subscribe\?|unsupported protocol'
+# Later stages: these only appear if the server actually processed the chain
 LOG_HIGH=(
-    '/player/timeline/subscribe\?([^ ]*&)?protocol=[a-z0-9+.-]{1,16}(%3a|%253a|:)'
     'searchOne\?[^ ]*identifier=[^& ]*(%2f|%252f|/)function(%2f|%252f|/)'
     'GetResultFromNetwork'
     'TranscoderH264Options(=|%3d)[^& ]*(dump(-|%2d)yuv|stats(=|%3d))'
@@ -211,6 +217,7 @@ LOG_MED=(
 check_prefs() {
     local p="$1/Preferences.xml" val
     [ -f "$p" ] || { info "no Preferences.xml"; return; }
+    [ -r "$p" ] || { warn "Preferences.xml: not readable - run as root to check it"; return; }
     val=$(grep -oE 'TranscoderH264Options="[^"]*"' "$p")
     if [ -z "$val" ]; then
         ok "Preferences.xml: TranscoderH264Options not set"
@@ -230,12 +237,31 @@ check_logs() {
     if [ ${#logs[@]} -eq 0 ]; then info "no logs under $1/Logs"; return; fi
     m=$(grep -ahoE '^[A-Z][a-z]{2} [0-9]{2}, [0-9]{4}' "${logs[@]}" 2>/dev/null | sort -u | head -1)
     info "scanning ${#logs[@]} log file(s)${m:+, oldest entry ~ $m}. PMS keeps few rotations; copy Logs/ somewhere safe now if you find anything"
+    # Stage 1: who tried, when, and whether the server accepted it
+    local reqs accepted
+    reqs=$(grep -ahiE -- "Request: .*$LOG_ATTEMPT" "${logs[@]}" 2>/dev/null)
+    if [ -n "$reqs" ]; then
+        accepted=$(grep -ahiE -- "Completed: \[[^]]*\] 2[0-9][0-9] [A-Z]+ $LOG_ATTEMPT" "${logs[@]}" 2>/dev/null)
+        if [ -n "$accepted" ]; then
+            hit "log: exploit SSRF request ACCEPTED by the server (2xx) - the server was vulnerable when this ran"
+            printf '%s\n' "$accepted" | head -4 | indent
+        else
+            attempt "log: exploit attempted but REJECTED by the server ($(printf '%s\n' "$reqs" | wc -l) request(s), none answered 2xx)"
+        fi
+        info "exploit attempts by source (count, source ip, first seen, last seen):"
+        printf '%s\n' "$reqs" | sed -nE 's/^([A-Z][a-z]{2} [0-9]{2}, [0-9]{4} [0-9:]{8}).*Request: \[([^]:]+):[0-9]+ \(([^)]*)\)\].*/\2 (\3)\t\1/p' \
+            | sort -s -t$'\t' -k1,1 | awk -F'\t' '{n[$1]++; if(!($1 in f)) f[$1]=$2; l[$1]=$2} END {for (k in n) printf "%5d  %s  %s  ->  %s\n", n[k], k, f[k], l[k]}' | indent
+        info "a LAN/Subnet source means a device on your own network sent it (you testing, or a compromised machine)"
+    fi
+    # Later stages: only lines that are not just an echo of a stage-1 request
+    local rest
+    rest=$(grep -ahivE -- "$LOG_ATTEMPT_ECHO" "${logs[@]}" 2>/dev/null)
     for pat in "${LOG_HIGH[@]}"; do
-        m=$(grep -ahiE -- "$pat" "${logs[@]}" 2>/dev/null)
-        [ -n "$m" ] && { hit "log: exploit request /$pat/ ($(printf '%s\n' "$m" | wc -l) lines)"; printf '%s\n' "$m" | head -4 | indent; }
+        m=$(printf '%s\n' "$rest" | grep -aiE -- "$pat")
+        [ -n "$m" ] && { hit "log: later exploit stage executed /$pat/ ($(printf '%s\n' "$m" | wc -l) lines)"; printf '%s\n' "$m" | head -4 | indent; }
     done
     for pat in "${LOG_MED[@]}"; do
-        m=$(grep -ahiE -- "$pat" "${logs[@]}" 2>/dev/null | grep -viE 'path=https?(%3a|:)(%2f|/){2}(127\.0\.0\.1|localhost)')
+        m=$(printf '%s\n' "$rest" | grep -aiE -- "$pat" | grep -viE 'path=https?(%3a|:)(%2f|/){2}(127\.0\.0\.1|localhost)')
         [ -n "$m" ] && { warn "log: suspicious /$pat/ ($(printf '%s\n' "$m" | wc -l) lines)"; printf '%s\n' "$m" | head -4 | indent; }
     done
     for ip in "${IOC_IPS[@]}"; do
@@ -317,6 +343,7 @@ declare -A PLEX_UIDS=()    # uids Plex runs as (per namespace)
 HOST_NS=$(proc_pidns self)
 for pid in "${PMS_PIDS[@]}"; do
     ns=$(proc_pidns "$pid"); u=$(proc_uid "$pid")
+    [ -n "$ns" ] || { [ $IS_ROOT -eq 1 ] || warn "can't inspect Plex process $pid without root - the process checks below are incomplete"; continue; }
     PLEX_NS[$ns]=1; PLEX_UIDS["$ns:$u"]=1
 done
 PLEX_USER_UID=$(id -u plex 2>/dev/null || true)
@@ -491,6 +518,24 @@ fi
 # ------------------------------------------------------------------ 6. persistence
 section "6. Persistence"
 pers_hits=0
+# pkg_unmodified ROOT PATH: true if PATH belongs to a dpkg/rpm package and still matches the package checksum
+pkg_unmodified() {
+    local r="${1:-/}" f="$2" pkg cand
+    for cand in "$f" "/usr$f" "${f#/usr}"; do
+        if command -v dpkg-query >/dev/null 2>&1 && [ -d "$r/var/lib/dpkg" ]; then
+            pkg=$(dpkg-query --admindir="$r/var/lib/dpkg" -S "$cand" 2>/dev/null | head -1 | cut -d: -f1)
+            if [ -n "$pkg" ]; then
+                dpkg --root="$r" --verify "$pkg" 2>/dev/null | grep -qF -- "/${f##*/}" && return 1
+                return 0
+            fi
+        fi
+    done
+    if [ "$r" = / ] && command -v rpm >/dev/null 2>&1 && rpm -qf "$f" >/dev/null 2>&1; then
+        rpm -Vf "$f" 2>/dev/null | grep -qF -- "/${f##*/}" && return 1
+        return 0
+    fi
+    return 1
+}
 for r in "${ROOTS[@]}"; do
     label=${r:-host}
     # cron
@@ -502,10 +547,13 @@ for r in "${ROOTS[@]}"; do
             warn "[$label] cron file changed since $SINCE: $f"; pers_hits=1
         fi
     done
-    # systemd units
+    # systemd units (package updates, e.g. the Plex update itself, legitimately touch these)
+    declare -A seen_unit=()
     while IFS= read -r -d '' f; do
+        k=$(stat -L -c '%d:%i' -- "$f" 2>/dev/null); [ -n "${seen_unit[$k]:-}" ] && continue; seen_unit[$k]=1
         if grep -qaE -- "$IOC_STRINGS" "$f" 2>/dev/null; then hit "[$label] systemd unit with payload strings: $f"; pers_hits=1
-        else warn "[$label] systemd unit created/changed since $SINCE: $f"; pers_hits=1; fi
+        elif pkg_unmodified "$r" "${f#"$r"}"; then :
+        else warn "[$label] systemd unit created/changed since $SINCE and not an unmodified package file: $f"; pers_hits=1; fi
     done < <(find "$r/etc/systemd/system" "$r/lib/systemd/system" "$r/usr/lib/systemd/system" -maxdepth 2 -type f -newermt "$SINCE" -print0 2>/dev/null)
     # Plex user's home: ssh keys, shell rc, user units
     for home in "$r/var/lib/plexmediaserver" "$r/config"; do
@@ -533,9 +581,9 @@ fi
 
 # ------------------------------------------------------------------ verdict
 section "Summary"
-printf '%d hit(s), %d warning(s)\n\n' "$HITS" "$WARNS"
+printf '%d hit(s), %d blocked attempt(s), %d warning(s)\n\n' "$HITS" "$ATTEMPTS" "$WARNS"
 if [ "$HITS" -gt 0 ]; then
-    printf '%sLIKELY COMPROMISED.%s Suggested response:\n' "$R" "$N"
+    printf '%sINDICATORS OF COMPROMISE FOUND.%s Suggested response:\n' "$R" "$N"
     cat <<'EOF'
   1. Preserve evidence first: copy the Plex Logs/ dir, Preferences.xml and any flagged files.
   2. Stop Plex, kill flagged PIDs, delete planted zz*.so files from Codecs/ (or delete the whole
@@ -547,6 +595,12 @@ if [ "$HITS" -gt 0 ]; then
      with other services, treat the whole host/container as compromised and rebuild it.
   6. Stop port-forwarding 32400 unless you need it; block the IOC IPs at your firewall.
 EOF
+elif [ "$ATTEMPTS" -gt 0 ]; then
+    printf '%sEXPLOIT ATTEMPTED BUT BLOCKED.%s The server rejected the first stage and no later stage,\n' "$Y" "$N"
+    printf 'planted file or payload was found. Nothing on this server needs cleaning up, but:\n'
+    printf '  - identify the source IP(s) listed in section 2; if it was not you testing, investigate that machine\n'
+    printf '  - if Plex was ever on a vulnerable build while reachable, change your Plex password and sign out all devices\n'
+    [ $IS_ROOT -eq 1 ] || printf '  - re-run as root: this run could not check Preferences.xml or Plex'"'"'s processes\n'
 elif [ "$WARNS" -gt 0 ]; then
     printf '%sReview the warnings above.%s A vulnerable version alone does not mean you were hit, but\n' "$Y" "$N"
     printf 'if 32400 was exposed to the internet on a vulnerable build, update and rotate your Plex password.\n'
@@ -556,5 +610,5 @@ fi
 printf '\nLimits: logs only go back a few rotations; attackers can change names, IPs and paths.\n'
 
 [ "$HITS" -gt 0 ] && exit 2
-[ "$WARNS" -gt 0 ] && exit 1
+[ "$WARNS" -gt 0 ] || [ "$ATTEMPTS" -gt 0 ] && exit 1
 exit 0
